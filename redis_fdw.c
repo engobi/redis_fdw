@@ -310,10 +310,13 @@ redisPlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel)
 	reply = redisCommand(context, "DBSIZE");
 
 	if (!reply)
+	{
+		redisFree(context);
 		ereport(ERROR, 
 			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION), 
 			errmsg("failed to get the database size: %d", context->err)
 			));
+	}
 
 	/*
 	 * Construct FdwPlan with cost estimates.
@@ -355,10 +358,13 @@ redisExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	reply = redisCommand(festate->context, "DBSIZE");
 
 	if (!reply)
+	{
+		redisFree(festate->context);
 		ereport(ERROR, 
 			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION), 
 			errmsg("failed to get the database size: %d", festate->context->err)
 			));
+	}
 
 	/* Suppress file size if we're not showing cost details */
 	if (es->costs)
@@ -394,10 +400,13 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	context = redisConnectWithTimeout(svr_address, svr_port, timeout);
 
 	if (context->err)
+	{
+		redisFree(context);
 		ereport(ERROR, 
 			(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION), 
 			errmsg("failed to connect to Redis: %d", context->err)
 			));
+	}
 
 	/* Stash away the state info we have already */
 	festate = (RedisFdwExecutionState *) palloc(sizeof(RedisFdwExecutionState));
@@ -415,10 +424,13 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	reply = redisCommand(context, "KEYS *");
 
 	if (!reply)
+	{
+		redisFree(festate->context);
 		ereport(ERROR, 
 			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION), 
 			errmsg("failed to list keys: %d", context->err)
 			));
+	}
 
 	/* Store the additional state info */
 	festate->attinmeta = TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att);
@@ -466,9 +478,12 @@ redisIterateForeignScan(ForeignScanState *node)
 		reply = redisCommand(festate->context, "GET %s", key);
 
 		if (!reply)
+		{
+			redisFree(festate->context);
 			ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY), 
 				errmsg("failed to get the value for key \"%s\": %d", key, festate->context->err)
 				));
+		}
 
 		festate->row++;
 		found = true;
