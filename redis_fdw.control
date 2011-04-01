@@ -1,0 +1,5 @@
+# redis_fdw extension
+comment = 'foreign-data wrapper for a Redis query'
+default_version = '1.0'
+module_pathname = '$libdir/redis_fdw'
+relocatable = true
