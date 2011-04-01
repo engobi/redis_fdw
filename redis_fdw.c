@@ -52,7 +52,7 @@ PG_MODULE_MAGIC;
 struct RedisFdwOption
 {
 	const char	*optname;
-	Oid		optcontext;		/* Oid of catalog in which option may appear */
+	Oid		optcontext;	/* Oid of catalog in which option may appear */
 };
 
 /*
@@ -177,19 +177,30 @@ redis_fdw_validator(PG_FUNCTION_ARGS)
 					                 opt->optname);
 			}
 
-			ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_OPTION_NAME), errmsg("invalid option \"%s\"", def->defname), errhint("Valid options in this context are: %s", buf.len ? buf.data : "<none>")));
+			ereport(ERROR, 
+				(errcode(ERRCODE_FDW_INVALID_OPTION_NAME), 
+				errmsg("invalid option \"%s\"", def->defname), 
+				errhint("Valid options in this context are: %s", buf.len ? buf.data : "<none>")
+				));
 		}
 
 		if (strcmp(def->defname, "address") == 0)
 		{
 			if (svr_address)
-				ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options: address (%s)", defGetString(def))));
+				ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), 
+					errmsg("conflicting or redundant options: address (%s)", defGetString(def))
+					));
+
 			svr_address = defGetString(def);
 		}
 		else if (strcmp(def->defname, "port") == 0)
 		{
 			if (svr_port)
-				ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options: port (%s)", defGetString(def))));
+				ereport(ERROR, 
+					(errcode(ERRCODE_SYNTAX_ERROR), 
+					errmsg("conflicting or redundant options: port (%s)", defGetString(def))
+					));
+
 			svr_port = atoi(defGetString(def));
 		}
 	}
@@ -290,13 +301,19 @@ redisPlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel)
 	context = redisConnectWithTimeout(svr_address, svr_port, timeout);
 
 	if (context->err)
-		ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION), errmsg("failed to connect to Redis: %d", context->err)));
+		ereport(ERROR, 
+			(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION), 
+			errmsg("failed to connect to Redis: %d", context->err)
+			));
 
 	/* Execute a query to get the database size */
 	reply = redisCommand(context, "DBSIZE");
 
 	if (!reply)
-		ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION), errmsg("failed to get the database size: %d", context->err)));
+		ereport(ERROR, 
+			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION), 
+			errmsg("failed to get the database size: %d", context->err)
+			));
 
 	/*
 	 * Construct FdwPlan with cost estimates.
@@ -338,7 +355,10 @@ redisExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	reply = redisCommand(festate->context, "DBSIZE");
 
 	if (!reply)
-		ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION), errmsg("failed to get the database size: %d", festate->context->err)));
+		ereport(ERROR, 
+			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION), 
+			errmsg("failed to get the database size: %d", festate->context->err)
+			));
 
 	/* Suppress file size if we're not showing cost details */
 	if (es->costs)
@@ -374,7 +394,10 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	context = redisConnectWithTimeout(svr_address, svr_port, timeout);
 
 	if (context->err)
-		ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION), errmsg("failed to connect to Redis: %d", context->err)));
+		ereport(ERROR, 
+			(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION), 
+			errmsg("failed to connect to Redis: %d", context->err)
+			));
 
 	/* Stash away the state info we have already */
 	festate = (RedisFdwExecutionState *) palloc(sizeof(RedisFdwExecutionState));
@@ -392,7 +415,10 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	reply = redisCommand(context, "KEYS *");
 
 	if (!reply)
-		ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION), errmsg("failed to list keys: %d", context->err)));
+		ereport(ERROR, 
+			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION), 
+			errmsg("failed to list keys: %d", context->err)
+			));
 
 	/* Store the additional state info */
 	festate->attinmeta = TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att);
@@ -440,7 +466,9 @@ redisIterateForeignScan(ForeignScanState *node)
 		reply = redisCommand(festate->context, "GET %s", key);
 
 		if (!reply)
-			ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY), errmsg("failed to get the value for key \"%s\": %d", key, festate->context->err)));
+			ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY), 
+				errmsg("failed to get the value for key \"%s\": %d", key, festate->context->err)
+				));
 
 		festate->row++;
 		found = true;
