@@ -3,13 +3,13 @@
  * redis_fdw.c
  *		  foreign-data wrapper for Redis
  *
- * Copyright (c) 2010-2011, PostgreSQL Global Development Group
+ * Copyright (c) 2011, PostgreSQL Global Development Group
+ *
+ * Author: Dave Page <dpage@pgadmin.org>
  *
  * IDENTIFICATION
  *		  redis_fdw/redis_fdw.c
  *
- * TODO:
- *	- Properly handle queries with quals
  *-------------------------------------------------------------------------
  */
 
@@ -42,6 +42,8 @@
 #include "utils/builtins.h"
 
 PG_MODULE_MAGIC;
+
+#define PROCID_TEXTEQ 67
 
 /*
  * Describes the valid options for objects that use this wrapper.
@@ -109,6 +111,7 @@ static void redisEndForeignScan(ForeignScanState *node);
  */
 static bool redisIsValidOption(const char *option, Oid context);
 static void redisGetOptions(Oid foreigntableid, char **address, int *port, char **password, int *database);
+static void redisGetQual(Node *node, TupleDesc tupdesc, char **key, char **value, bool *pushdown);
 
 /*
  * Foreign-data wrapper handler function: return a struct with pointers
@@ -462,6 +465,9 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	int			svr_database = 0;
 	redisContext		*context;
 	redisReply		*reply;
+	char			*qual_key = NULL;
+	char			*qual_value = NULL;
+	bool			pushdown = false;
 	RedisFdwExecutionState	*festate;
 	struct timeval		timeout = {1, 500000};
 
@@ -524,6 +530,26 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 
 	freeReplyObject(reply);
 
+	/* See if we've got any quals we can push down */
+	if (node->ss.ps.plan->qual)
+	{
+		ListCell	*lc;
+		bool		first = true;
+
+		foreach (lc, node->ss.ps.qual)
+		{
+			/* Only the first qual can be pushed down to Redis */
+			ExprState  *state = lfirst(lc);
+
+			redisGetQual((Node *) state->expr, node->ss.ss_currentRelation->rd_att, &qual_key, &qual_value, &pushdown);
+			if (pushdown)
+			{
+				if (first)
+					break;
+			}
+		}
+	}
+
 	/* Stash away the state info we have already */
 	festate = (RedisFdwExecutionState *) palloc(sizeof(RedisFdwExecutionState));
 	node->fdw_state = (void *) festate;
@@ -537,7 +563,13 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 		return;
 
 	/* Execute the query */
-	reply = redisCommand(context, "KEYS *");
+	if (qual_value && pushdown)
+	{
+		reply = redisCommand(context, "KEYS %s", qual_value);
+		elog(NOTICE, "Executed: KEYS %s", qual_value);
+	}
+	else
+		reply = redisCommand(context, "KEYS *");
 
 	if (!reply)
 	{
@@ -695,3 +727,56 @@ redisReScanForeignScan(ForeignScanState *node)
 	festate->row = 0;
 }
 
+static void
+redisGetQual(Node *node, TupleDesc tupdesc, char **key, char **value, bool *pushdown)
+{
+	*key = NULL;
+	*value = NULL;
+	*pushdown = false;
+
+	if (!node)
+		return;
+
+	if (IsA(node, OpExpr))
+	{
+		OpExpr	*op = (OpExpr *) node;
+		Node	*left, *right;
+		Index	varattno;
+
+		if (list_length(op->args) != 2)
+			return;
+
+		left = list_nth(op->args, 0);
+
+		if (!IsA(left, Var))
+			return;
+
+		varattno = ((Var *) left)->varattno;
+
+		right = list_nth(op->args, 1);
+
+		if (IsA(right, Const))
+		{
+			StringInfoData  buf;
+
+			initStringInfo(&buf);
+
+			/* And get the column and value... */
+			*key = NameStr(tupdesc->attrs[varattno - 1]->attname);
+			*value = TextDatumGetCString(((Const *) right)->constvalue);
+
+			/*
+			 * We can push down this qual if:
+			 * - The operatory is TEXTEQ
+			 * - The qual is on the key column
+			 */
+			if (op->opfuncid == PROCID_TEXTEQ && strcmp(*key, "key") == 0)
+                        	*pushdown = true;
+
+			elog(NOTICE, "Got qual %s = %s", *key, *value);
+			return;
+		}
+	}
+
+	return;
+}
