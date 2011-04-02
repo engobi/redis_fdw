@@ -1,9 +1,10 @@
 /*-------------------------------------------------------------------------
  *
- * redis_fdw.c
  *		  foreign-data wrapper for Redis
  *
  * Copyright (c) 2011, PostgreSQL Global Development Group
+ *
+ * This software is released under the PostgreSQL Licence
  *
  * Author: Dave Page <dpage@pgadmin.org>
  *
