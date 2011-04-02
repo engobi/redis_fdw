@@ -10,16 +10,13 @@
  *
  * TODO:
  *	- Properly handle queries with quals
- *      - Handle different Redis datatypes correctly
- *	- Figure out how to make Redis scans atomic (or at the least,
- *	  properly handle tuples that have been removed since the initial
- *	  scan)
  *      - Handle Redis authentication
+ *	- Allow the use of different Redis databases
  *-------------------------------------------------------------------------
  */
 
 /* Debug mode */
-#define DEBUG
+/* #define DEBUG */
 
 #include "postgres.h"
 
@@ -102,7 +99,6 @@ static void redisBeginForeignScan(ForeignScanState *node, int eflags);
 static TupleTableSlot *redisIterateForeignScan(ForeignScanState *node);
 static void redisReScanForeignScan(ForeignScanState *node);
 static void redisEndForeignScan(ForeignScanState *node);
-static void redisErrorCallback(void *arg);
 
 /*
  * Helper functions
@@ -446,9 +442,9 @@ static TupleTableSlot *
 redisIterateForeignScan(ForeignScanState *node)
 {
 	bool			found;
-	ErrorContextCallback	errcontext;
-	redisReply		*reply;
+	redisReply		*reply = 0;
 	char			*key;
+	char 			*data = 0;
 	char			**values;
 	HeapTuple		tuple;
 
@@ -459,12 +455,6 @@ redisIterateForeignScan(ForeignScanState *node)
 	elog(NOTICE, "redisIterateForeignScan");
 #endif
 
-	/* Set up callback to identify error line number. */
-	errcontext.callback = redisErrorCallback;
-	errcontext.arg = (void *) festate;
-	errcontext.previous = error_context_stack;
-	error_context_stack = &errcontext;
-
 	/* Cleanup */
 	ExecClearTuple(slot);
 
@@ -473,20 +463,58 @@ redisIterateForeignScan(ForeignScanState *node)
 
 	if (festate->row < festate->reply->elements)
 	{
-		/* We expect to find a row */
-		key = festate->reply->element[festate->row]->str;
-		reply = redisCommand(festate->context, "GET %s", key);
-
-		if (!reply)
+                /*
+		 * Get the row, check the result type, and handle accordingly. 
+                 * If it's nil, we go ahead and get the next row.
+                 */
+		do 
 		{
-			redisFree(festate->context);
-			ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY), 
-				errmsg("failed to get the value for key \"%s\": %d", key, festate->context->err)
-				));
+			key = festate->reply->element[festate->row]->str;
+			reply = redisCommand(festate->context, "GET %s", key);
+
+			if (!reply)
+			{
+                        	freeReplyObject(festate->reply);
+				redisFree(festate->context);
+				ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY), 
+					errmsg("failed to get the value for key \"%s\": %d", key, festate->context->err)
+					));
+			}
+
+			festate->row++;
+
+		} while ((reply->type == REDIS_REPLY_NIL ||
+			  reply->type == REDIS_REPLY_STATUS ||
+			  reply->type == REDIS_REPLY_ERROR) && 
+			  festate->row < festate->reply->elements);
+
+		if (festate->row <= festate->reply->elements)
+		{
+			/* 
+		 	 * Now, deal with the different data types we might
+			 * have got from Redis.
+			 */
+
+			switch (reply->type)
+			{
+				case REDIS_REPLY_INTEGER:
+					data = (char *) palloc(sizeof(char) * 64);
+					snprintf(data, 64, "%lld", reply->integer);
+					found = true;
+					break;
+
+				case REDIS_REPLY_STRING:
+					data = reply->str;
+					found = true;
+					break;
+
+				case REDIS_REPLY_ARRAY:
+					data = "<array>";
+					found = true;
+					break;
+			}
 		}
 
-		festate->row++;
-		found = true;
 	}
 
 	/* Build the tuple */
@@ -495,25 +523,16 @@ redisIterateForeignScan(ForeignScanState *node)
 	if (found)
 	{
 		values[0] = key;
-		values[1] = reply->str;
+		values[1] = data;
 		tuple = BuildTupleFromCStrings(festate->attinmeta, values);
 		ExecStoreTuple(tuple, slot, InvalidBuffer, false);
 	}
 
-	/* Remove error callback. */
-	error_context_stack = errcontext.previous;
+	/* Cleanup */
+	if (reply)
+		freeReplyObject(reply);
 
 	return slot;
-}
-
-static void
-redisErrorCallback(void *arg)
-{
-#ifdef DEBUG
-	elog(NOTICE, "redisErrorCallback");
-#endif
-
-	/* TODO: Write the error handler */
 }
 
 /*
