@@ -264,7 +264,7 @@ redisGetOptions(Oid foreigntableid, char **address, int *port, char **password, 
 	ForeignTable	*table;
 	ForeignServer	*server;
 	UserMapping	*mapping;
-	List	    *options;
+	List		*options;
 	ListCell	*lc;
 
 #ifdef DEBUG
@@ -531,11 +531,10 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 
 	freeReplyObject(reply);
 
-	/* See if we've got any quals we can push down */
+	/* See if we've got a qual we can push down */
 	if (node->ss.ps.plan->qual)
 	{
 		ListCell	*lc;
-		bool		first = true;
 
 		foreach (lc, node->ss.ps.qual)
 		{
@@ -544,10 +543,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 
 			redisGetQual((Node *) state->expr, node->ss.ss_currentRelation->rd_att, &qual_key, &qual_value, &pushdown);
 			if (pushdown)
-			{
-				if (first)
-					break;
-			}
+				break;
 		}
 	}
 
