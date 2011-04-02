@@ -10,7 +10,6 @@
  *
  * TODO:
  *	- Properly handle queries with quals
- *      - Handle Redis authentication
  *-------------------------------------------------------------------------
  */
 
@@ -29,6 +28,7 @@
 #include "access/reloptions.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
+#include "catalog/pg_user_mapping.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
@@ -62,6 +62,7 @@ static struct RedisFdwOption valid_options[] =
 	/* Connection options */
 	{ "address",		ForeignServerRelationId },
 	{ "port",		ForeignServerRelationId },
+	{ "password",		UserMappingRelationId },
 	{ "database",		ForeignTableRelationId },
 
 	/* Sentinel */
@@ -80,6 +81,7 @@ typedef struct RedisFdwExecutionState
 	long long	row;
 	char		*address;
 	int		port;
+	char		*password;
 	int		database;
 } RedisFdwExecutionState;
 
@@ -106,7 +108,7 @@ static void redisEndForeignScan(ForeignScanState *node);
  * Helper functions
  */
 static bool redisIsValidOption(const char *option, Oid context);
-static void redisGetOptions(Oid foreigntableid, char **address, int *port, int *database);
+static void redisGetOptions(Oid foreigntableid, char **address, int *port, char **password, int *database);
 
 /*
  * Foreign-data wrapper handler function: return a struct with pointers
@@ -144,6 +146,8 @@ redis_fdw_validator(PG_FUNCTION_ARGS)
 	Oid		catalog = PG_GETARG_OID(1);
 	char		*svr_address = NULL;
 	int		svr_port = 0;
+	char		*svr_password = NULL;
+	int		svr_database = 0;
 	ListCell	*cell;
 
 #ifdef DEBUG
@@ -172,7 +176,7 @@ redis_fdw_validator(PG_FUNCTION_ARGS)
 			{
 				if (catalog == opt->optcontext)
 					appendStringInfo(&buf, "%s%s", (buf.len > 0) ? ", " : "",
-					                 opt->optname);
+							 opt->optname);
 			}
 
 			ereport(ERROR, 
@@ -200,6 +204,25 @@ redis_fdw_validator(PG_FUNCTION_ARGS)
 					));
 
 			svr_port = atoi(defGetString(def));
+		}
+		if (strcmp(def->defname, "password") == 0)
+		{
+			if (svr_password)
+				ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR),
+					errmsg("conflicting or redundant options: password")
+					));
+
+			svr_password = defGetString(def);
+		}
+		else if (strcmp(def->defname, "database") == 0)
+		{
+			if (svr_database)
+				ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					errmsg("conflicting or redundant options: database (%s)", defGetString(def))
+					));
+
+			svr_database = atoi(defGetString(def));
 		}
 	}
 
@@ -232,12 +255,13 @@ redisIsValidOption(const char *option, Oid context)
  * Fetch the options for a redis_fdw foreign table.
  */
 static void
-redisGetOptions(Oid foreigntableid, char **address, int *port, int *database)
+redisGetOptions(Oid foreigntableid, char **address, int *port, char **password, int *database)
 {
 	ForeignTable	*table;
 	ForeignServer	*server;
-	List            *options;
-	ListCell        *lc;
+	UserMapping	*mapping;
+	List	    *options;
+	ListCell	*lc;
 
 #ifdef DEBUG
 	elog(NOTICE, "redisGetOptions");
@@ -250,10 +274,12 @@ redisGetOptions(Oid foreigntableid, char **address, int *port, int *database)
 	 */
 	table = GetForeignTable(foreigntableid);
 	server = GetForeignServer(table->serverid);
+	mapping = GetUserMapping(GetUserId(), table->serverid);
 
 	options = NIL;
 	options = list_concat(options, table->options);
 	options = list_concat(options, server->options);
+	options = list_concat(options, mapping->options);
 
 	/* Loop through the options, and get the server/port */
 	foreach(lc, options)
@@ -266,8 +292,11 @@ redisGetOptions(Oid foreigntableid, char **address, int *port, int *database)
 		if (strcmp(def->defname, "port") == 0)
 			*port = atoi(defGetString(def));
 
-                if (strcmp(def->defname, "database") == 0)
-                        *database = atoi(defGetString(def));
+		if (strcmp(def->defname, "password") == 0)
+			*password = defGetString(def);
+
+		if (strcmp(def->defname, "database") == 0)
+			*database = atoi(defGetString(def));
 	}
 
 	/* Default values, if required */
@@ -289,8 +318,9 @@ static FdwPlan *
 redisPlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel)
 {
 	FdwPlan		*fdwplan;
-	char		*svr_address = 0;
+	char		*svr_address = NULL;
 	int		svr_port = 0;
+	char		*svr_password = NULL;
 	int 		svr_database = 0;
 	redisContext	*context;
 	redisReply	*reply;
@@ -301,7 +331,7 @@ redisPlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel)
 #endif
 
 	/* Fetch options  */
-	redisGetOptions(foreigntableid, &svr_address, &svr_port, &svr_database);
+	redisGetOptions(foreigntableid, &svr_address, &svr_port, &svr_password, &svr_database);
 
 	/* Connect to the database */
 	context = redisConnectWithTimeout(svr_address, svr_port, timeout);
@@ -312,17 +342,34 @@ redisPlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel)
 			errmsg("failed to connect to Redis: %d", context->err)
 			));
 
+	/* Authenticate */
+	if (svr_password)
+	{
+	       reply = redisCommand(context, "AUTH %s", svr_password);
+
+	       if (!reply)
+		{
+			redisFree(context);
+			ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+				errmsg("failed to authenticate to redis: %d", context->err)
+				));
+		}
+
+		freeReplyObject(reply);
+	}
+
 	/* Select the appropriate database */
 	reply = redisCommand(context, "SELECT %d", svr_database);
 
-        if (!reply)
-        {
-                redisFree(context);
-                ereport(ERROR, 
-                        (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION), 
-                        errmsg("failed to select database %d: %d", svr_database, context->err)
-                        ));
-        }
+	if (!reply)
+	{
+		redisFree(context);
+		ereport(ERROR, 
+			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION), 
+			errmsg("failed to select database %d: %d", svr_database, context->err)
+			));
+	}
 
 	/* Execute a query to get the database size */
 	reply = redisCommand(context, "DBSIZE");
@@ -379,8 +426,17 @@ redisExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	{
 		redisFree(festate->context);
 		ereport(ERROR, 
-			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION), 
+			(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION), 
 			errmsg("failed to get the database size: %d", festate->context->err)
+			));
+	}
+
+	if (reply->type == REDIS_REPLY_ERROR)
+	{
+		char *err = pstrdup(reply->str);
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+			errmsg("failed to get the database size: %s", err)
 			));
 	}
 
@@ -400,8 +456,9 @@ redisExplainForeignScan(ForeignScanState *node, ExplainState *es)
 static void
 redisBeginForeignScan(ForeignScanState *node, int eflags)
 {
-	char			*svr_address = 0;
+	char			*svr_address = NULL;
 	int			svr_port = 0;
+	char			*svr_password = NULL;
 	int			svr_database = 0;
 	redisContext		*context;
 	redisReply		*reply;
@@ -413,7 +470,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 #endif
 
 	/* Fetch options  */
-	redisGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &svr_address, &svr_port, &svr_database);
+	redisGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &svr_address, &svr_port, &svr_password, &svr_database);
 
 	/* Connect to the server */
 	context = redisConnectWithTimeout(svr_address, svr_port, timeout);
@@ -423,21 +480,49 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 		redisFree(context);
 		ereport(ERROR, 
 			(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION), 
-			errmsg("failed to connect to Redis: %d", context->err)
+			errmsg("failed to connect to Redis: %s", context->errstr)
 			));
 	}
 
-        /* Select the appropriate database */
-        reply = redisCommand(context, "SELECT %d", svr_database);
+	/* Authenticate */
+	if (svr_password)
+	{
+	       reply = redisCommand(context, "AUTH %s", svr_password);
 
-        if (!reply)
-        {
-                redisFree(context);
-                ereport(ERROR,
-                        (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-                        errmsg("failed to select database %d: %d", svr_database, context->err)
-                        ));
-        }
+ 	       if (!reply)
+		{
+			redisFree(context);
+			ereport(ERROR,
+   			     	(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+				errmsg("failed to authenticate to redis: %s", context->errstr)
+				));
+		}
+
+		freeReplyObject(reply);
+	}
+
+	/* Select the appropriate database */
+	reply = redisCommand(context, "SELECT %d", svr_database);
+
+	if (!reply)
+	{
+		redisFree(context);
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+			errmsg("failed to select database %d: %s", svr_database, context->errstr)
+			));
+	}
+
+	if (reply->type == REDIS_REPLY_ERROR)
+	{
+		char *err = pstrdup(reply->str);
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+			errmsg("failed to select database %d: %s", svr_database, err)
+			));
+	}
+
+	freeReplyObject(reply);
 
 	/* Stash away the state info we have already */
 	festate = (RedisFdwExecutionState *) palloc(sizeof(RedisFdwExecutionState));
@@ -459,7 +544,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 		redisFree(festate->context);
 		ereport(ERROR, 
 			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION), 
-			errmsg("failed to list keys: %d", context->err)
+			errmsg("failed to list keys: %s", context->errstr)
 			));
 	}
 
@@ -498,10 +583,10 @@ redisIterateForeignScan(ForeignScanState *node)
 
 	if (festate->row < festate->reply->elements)
 	{
-                /*
+		/*
 		 * Get the row, check the result type, and handle accordingly. 
-                 * If it's nil, we go ahead and get the next row.
-                 */
+		 * If it's nil, we go ahead and get the next row.
+		 */
 		do 
 		{
 			key = festate->reply->element[festate->row]->str;
@@ -509,10 +594,10 @@ redisIterateForeignScan(ForeignScanState *node)
 
 			if (!reply)
 			{
-                        	freeReplyObject(festate->reply);
+				freeReplyObject(festate->reply);
 				redisFree(festate->context);
 				ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY), 
-					errmsg("failed to get the value for key \"%s\": %d", key, festate->context->err)
+					errmsg("failed to get the value for key \"%s\": %s", key, festate->context->errstr)
 					));
 			}
 
