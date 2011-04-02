@@ -11,7 +11,6 @@
  * TODO:
  *	- Properly handle queries with quals
  *      - Handle Redis authentication
- *	- Allow the use of different Redis databases
  *-------------------------------------------------------------------------
  */
 
@@ -29,6 +28,7 @@
 #include "funcapi.h"
 #include "access/reloptions.h"
 #include "catalog/pg_foreign_server.h"
+#include "catalog/pg_foreign_table.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
@@ -62,6 +62,7 @@ static struct RedisFdwOption valid_options[] =
 	/* Connection options */
 	{ "address",		ForeignServerRelationId },
 	{ "port",		ForeignServerRelationId },
+	{ "database",		ForeignTableRelationId },
 
 	/* Sentinel */
 	{ NULL,			InvalidOid }
@@ -79,6 +80,7 @@ typedef struct RedisFdwExecutionState
 	long long	row;
 	char		*address;
 	int		port;
+	int		database;
 } RedisFdwExecutionState;
 
 /*
@@ -104,7 +106,7 @@ static void redisEndForeignScan(ForeignScanState *node);
  * Helper functions
  */
 static bool redisIsValidOption(const char *option, Oid context);
-static void redisGetOptions(Oid foreigntableid, char **address, int *port);
+static void redisGetOptions(Oid foreigntableid, char **address, int *port, int *database);
 
 /*
  * Foreign-data wrapper handler function: return a struct with pointers
@@ -230,7 +232,7 @@ redisIsValidOption(const char *option, Oid context)
  * Fetch the options for a redis_fdw foreign table.
  */
 static void
-redisGetOptions(Oid foreigntableid, char **address, int *port)
+redisGetOptions(Oid foreigntableid, char **address, int *port, int *database)
 {
 	ForeignTable	*table;
 	ForeignServer	*server;
@@ -250,6 +252,7 @@ redisGetOptions(Oid foreigntableid, char **address, int *port)
 	server = GetForeignServer(table->serverid);
 
 	options = NIL;
+	options = list_concat(options, table->options);
 	options = list_concat(options, server->options);
 
 	/* Loop through the options, and get the server/port */
@@ -262,6 +265,9 @@ redisGetOptions(Oid foreigntableid, char **address, int *port)
 
 		if (strcmp(def->defname, "port") == 0)
 			*port = atoi(defGetString(def));
+
+                if (strcmp(def->defname, "database") == 0)
+                        *database = atoi(defGetString(def));
 	}
 
 	/* Default values, if required */
@@ -270,6 +276,9 @@ redisGetOptions(Oid foreigntableid, char **address, int *port)
 
 	if (!*port)
 		*port = 6379;
+
+	if (!*database)
+		*database = 0;
 }
 
 /*
@@ -282,6 +291,7 @@ redisPlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel)
 	FdwPlan		*fdwplan;
 	char		*svr_address = 0;
 	int		svr_port = 0;
+	int 		svr_database = 0;
 	redisContext	*context;
 	redisReply	*reply;
 	struct timeval  timeout = {1, 500000};
@@ -291,7 +301,7 @@ redisPlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel)
 #endif
 
 	/* Fetch options  */
-	redisGetOptions(foreigntableid, &svr_address, &svr_port);
+	redisGetOptions(foreigntableid, &svr_address, &svr_port, &svr_database);
 
 	/* Connect to the database */
 	context = redisConnectWithTimeout(svr_address, svr_port, timeout);
@@ -301,6 +311,18 @@ redisPlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel)
 			(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION), 
 			errmsg("failed to connect to Redis: %d", context->err)
 			));
+
+	/* Select the appropriate database */
+	reply = redisCommand(context, "SELECT %d", svr_database);
+
+        if (!reply)
+        {
+                redisFree(context);
+                ereport(ERROR, 
+                        (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION), 
+                        errmsg("failed to select database %d: %d", svr_database, context->err)
+                        ));
+        }
 
 	/* Execute a query to get the database size */
 	reply = redisCommand(context, "DBSIZE");
@@ -380,6 +402,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 {
 	char			*svr_address = 0;
 	int			svr_port = 0;
+	int			svr_database = 0;
 	redisContext		*context;
 	redisReply		*reply;
 	RedisFdwExecutionState	*festate;
@@ -390,9 +413,9 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 #endif
 
 	/* Fetch options  */
-	redisGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &svr_address, &svr_port);
+	redisGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &svr_address, &svr_port, &svr_database);
 
-	/* Connect to the database */
+	/* Connect to the server */
 	context = redisConnectWithTimeout(svr_address, svr_port, timeout);
 
 	if (context->err)
@@ -403,6 +426,18 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 			errmsg("failed to connect to Redis: %d", context->err)
 			));
 	}
+
+        /* Select the appropriate database */
+        reply = redisCommand(context, "SELECT %d", svr_database);
+
+        if (!reply)
+        {
+                redisFree(context);
+                ereport(ERROR,
+                        (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+                        errmsg("failed to select database %d: %d", svr_database, context->err)
+                        ));
+        }
 
 	/* Stash away the state info we have already */
 	festate = (RedisFdwExecutionState *) palloc(sizeof(RedisFdwExecutionState));
